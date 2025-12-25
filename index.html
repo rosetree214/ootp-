@@ -209,6 +209,8 @@
             padding: 5px;
             border-radius: 4px;
             font-size: 0.9em;
+            flex: 1;
+            margin: 0 10px;
         }
 
         .news-item {
@@ -397,7 +399,8 @@
                     <div class="controls-row">
                         <button onclick="simulateDay()">Simulate Day</button>
                         <button onclick="simulateWeek()">Simulate Week</button>
-                        <button onclick="simulateSeason()">Simulate to End of Season</button>
+                        <button onclick="simulateToPlayoffs()">Simulate to Playoffs</button>
+                        <button onclick="simulateSeason()">Simulate Full Season + Playoffs</button>
                     </div>
                 </div>
                 <div id="simResults"></div>
@@ -433,7 +436,10 @@
                 teams: {},
                 schedule: [],
                 currentDay: 0,
-                totalDays: 162
+                totalDays: 162,
+                season: new Date().getFullYear(),
+                seasonComplete: false,
+                playoffsComplete: false
             },
             userTeamId: null,
             news: [],
@@ -451,6 +457,21 @@
             'NL Central': [],
             'NL West': []
         };
+
+        // Position eligibility for lineup enforcement
+        const POSITION_GROUPS = {
+            'C': ['C'],
+            '1B': ['1B'],
+            '2B': ['2B'],
+            '3B': ['3B'],
+            'SS': ['SS'],
+            'LF': ['LF', 'OF'],
+            'CF': ['CF', 'OF'],
+            'RF': ['RF', 'OF'],
+            'DH': ['DH', 'C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF', 'OF']
+        };
+
+        const LINEUP_POSITIONS = ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF', 'DH'];
 
         // ========================================
         // INITIALIZATION & DATA LOADING
@@ -510,7 +531,8 @@
                         nextStarterIndex: 0,
                         record: { wins: 0, losses: 0 },
                         runsScored: 0,
-                        runsAllowed: 0
+                        runsAllowed: 0,
+                        gamesPlayed: 0
                     };
 
                     // Add to division
@@ -543,7 +565,7 @@
                 }
 
                 // Generate season schedule
-                generateSchedule();
+                await generateSchedule();
 
                 showSuccess(`Loaded ${successCount} team rosters successfully!`);
 
@@ -555,15 +577,29 @@
 
         async function fetchTeamRoster(teamId) {
             try {
-                // Try to fetch with stats hydration for 2024 season
-                const url = `${API_BASE}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,season=2024))`;
-                const response = await fetch(url);
+                // Use most recent completed season for stats (current year - 1 if before April)
+                const now = new Date();
+                const currentYear = now.getFullYear();
+                const month = now.getMonth(); // 0-11
+                const statsSeason = (month < 3) ? currentYear - 1 : currentYear; // Use previous year if Jan-Mar
+
+                // Try active roster first with stats hydration
+                let url = `${API_BASE}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,season=${statsSeason}))`;
+                let response = await fetch(url);
 
                 if (!response.ok) {
                     throw new Error(`HTTP error ${response.status}`);
                 }
 
-                const data = await response.json();
+                let data = await response.json();
+
+                // Fallback to 40-man roster if active is empty
+                if (!data.roster || data.roster.length === 0) {
+                    console.log(`Active roster empty for team ${teamId}, trying 40-man...`);
+                    url = `${API_BASE}/teams/${teamId}/roster?hydrate=person(stats(type=season,season=${statsSeason}))`;
+                    response = await fetch(url);
+                    data = await response.json();
+                }
 
                 if (!data.roster || data.roster.length === 0) {
                     throw new Error('No roster data');
@@ -589,7 +625,9 @@
                             AVG: 0, OBP: 0, SLG: 0, OPS: 0,
                             // Pitching stats
                             IP: 0, W: 0, L: 0, SV: 0, ER: 0, SO: 0, BBA: 0, HA: 0,
-                            ERA: 0, WHIP: 0
+                            ERA: 0, WHIP: 0,
+                            // Game appearances
+                            G: 0
                         }
                     };
 
@@ -698,7 +736,7 @@
                     ratings: generateHitterRatings(null),
                     stats: {
                         AB: 0, H: 0, R: 0, HR: 0, RBI: 0, BB: 0, K: 0, SB: 0,
-                        AVG: 0, OBP: 0, SLG: 0, OPS: 0
+                        AVG: 0, OBP: 0, SLG: 0, OPS: 0, G: 0
                     }
                 });
             }
@@ -714,41 +752,56 @@
                     ratings: generatePitcherRatings(null),
                     stats: {
                         IP: 0, W: 0, L: 0, SV: 0, ER: 0, SO: 0, BBA: 0, HA: 0,
-                        ERA: 0, WHIP: 0
+                        ERA: 0, WHIP: 0, G: 0
                     }
                 });
             }
         }
 
-        function generateSchedule() {
-            // Generate a simplified 162-game schedule
+        // Generate a balanced schedule
+        async function generateSchedule() {
             gameState.league.schedule = [];
             const teamIds = Object.keys(gameState.league.teams);
             const totalDays = 162;
 
-            for (let day = 0; day < totalDays; day++) {
-                const dayGames = [];
-                const teamsUsed = new Set();
+            // Simple balanced schedule - each team plays others multiple times
+            const gamesPerMatchup = Math.floor(totalDays / (teamIds.length - 1));
+            let day = 0;
 
-                // Try to schedule each team
+            for (let round = 0; round < gamesPerMatchup; round++) {
                 const shuffled = [...teamIds].sort(() => Math.random() - 0.5);
 
                 for (let i = 0; i < shuffled.length - 1; i += 2) {
-                    if (!teamsUsed.has(shuffled[i]) && !teamsUsed.has(shuffled[i + 1])) {
-                        dayGames.push({
-                            day: day,
-                            homeTeam: shuffled[i],
-                            awayTeam: shuffled[i + 1],
-                            played: false,
-                            homeScore: 0,
-                            awayScore: 0
-                        });
-                        teamsUsed.add(shuffled[i]);
-                        teamsUsed.add(shuffled[i + 1]);
-                    }
+                    if (day >= totalDays) break;
+
+                    gameState.league.schedule.push({
+                        day: day,
+                        homeTeam: shuffled[i],
+                        awayTeam: shuffled[i + 1],
+                        played: false,
+                        homeScore: 0,
+                        awayScore: 0
+                    });
                 }
 
-                gameState.league.schedule.push(...dayGames);
+                day++;
+            }
+
+            // Fill remaining days with random matchups
+            while (day < totalDays) {
+                const shuffled = [...teamIds].sort(() => Math.random() - 0.5);
+                for (let i = 0; i < shuffled.length - 1; i += 2) {
+                    if (day >= totalDays) break;
+                    gameState.league.schedule.push({
+                        day: day,
+                        homeTeam: shuffled[i],
+                        awayTeam: shuffled[i + 1],
+                        played: false,
+                        homeScore: 0,
+                        awayScore: 0
+                    });
+                }
+                day++;
             }
 
             console.log(`Generated schedule with ${gameState.league.schedule.length} games`);
@@ -761,15 +814,21 @@
         function autoSetLineup(teamId) {
             const team = gameState.league.teams[teamId];
 
-            // Auto-set lineup (best 9 position players)
-            const positionPlayers = team.roster.filter(p => !p.isPitcher)
-                .sort((a, b) => {
-                    const aAvg = (a.ratings.contact + a.ratings.power + a.ratings.eye) / 3;
-                    const bAvg = (b.ratings.contact + b.ratings.power + b.ratings.eye) / 3;
-                    return bAvg - aAvg;
-                });
+            // Auto-set lineup by position with best players
+            for (let i = 0; i < 9; i++) {
+                const requiredPos = LINEUP_POSITIONS[i];
+                const eligiblePlayers = getEligiblePlayersForPosition(teamId, requiredPos)
+                    .filter(p => !team.lineup.includes(p.id)) // Not already in lineup
+                    .sort((a, b) => {
+                        const aAvg = (a.ratings.contact + a.ratings.power + a.ratings.eye) / 3;
+                        const bAvg = (b.ratings.contact + b.ratings.power + b.ratings.eye) / 3;
+                        return bAvg - aAvg;
+                    });
 
-            team.lineup = positionPlayers.slice(0, 9).map(p => p.id);
+                if (eligiblePlayers.length > 0) {
+                    team.lineup[i] = eligiblePlayers[0].id;
+                }
+            }
 
             // Auto-set rotation (best 5 pitchers by ratings)
             const pitchers = team.roster.filter(p => p.isPitcher)
@@ -782,6 +841,17 @@
             team.rotation = pitchers.slice(0, 5).map(p => p.id);
         }
 
+        function getEligiblePlayersForPosition(teamId, position) {
+            const team = gameState.league.teams[teamId];
+            const eligible = POSITION_GROUPS[position] || [];
+
+            return team.roster.filter(p => {
+                if (p.isPitcher) return false;
+                // Check if player's position matches any eligible position
+                return eligible.includes(p.position) || eligible.includes('OF') && ['LF', 'CF', 'RF'].includes(p.position);
+            });
+        }
+
         // ========================================
         // SIMULATION ENGINE
         // ========================================
@@ -791,8 +861,8 @@
             const awayTeam = gameState.league.teams[awayTeamId];
 
             // Get starting pitchers
-            const homePitcher = getStartingPitcher(homeTeamId);
-            const awayPitcher = getStartingPitcher(awayTeamId);
+            let homePitcher = getStartingPitcher(homeTeamId);
+            let awayPitcher = getStartingPitcher(awayTeamId);
 
             // Advance rotation
             homeTeam.nextStarterIndex = (homeTeam.nextStarterIndex + 1) % 5;
@@ -806,12 +876,36 @@
                 awayLineScore: []
             };
 
+            // Track pitcher usage (stamina)
+            let homePitcherOuts = 0;
+            let awayPitcherOuts = 0;
+            const usedPitchers = new Set();
+            if (homePitcher) usedPitchers.add(homePitcher.id);
+            if (awayPitcher) usedPitchers.add(awayPitcher.id);
+
             // Simulate 9 innings
             for (let inning = 1; inning <= 9; inning++) {
+                // Check if pitchers need to be replaced (exceeded stamina)
+                if (homePitcher && homePitcherOuts > homePitcher.ratings.stamina / 5) {
+                    homePitcher = getBullpenPitcher(homeTeamId, usedPitchers);
+                    if (homePitcher) {
+                        usedPitchers.add(homePitcher.id);
+                        homePitcherOuts = 0;
+                    }
+                }
+                if (awayPitcher && awayPitcherOuts > awayPitcher.ratings.stamina / 5) {
+                    awayPitcher = getBullpenPitcher(awayTeamId, usedPitchers);
+                    if (awayPitcher) {
+                        usedPitchers.add(awayPitcher.id);
+                        awayPitcherOuts = 0;
+                    }
+                }
+
                 // Top of inning (away team bats)
-                const awayRuns = simulateHalfInning(awayTeamId, homeTeamId, homePitcher);
-                awayScore += awayRuns;
-                boxScore.awayLineScore.push(awayRuns);
+                const awayResult = simulateHalfInning(awayTeamId, homeTeamId, homePitcher, false);
+                awayScore += awayResult.runs;
+                homePitcherOuts += awayResult.outs;
+                boxScore.awayLineScore.push(awayResult.runs);
 
                 // Bottom of inning (home team bats)
                 // If home team is winning in bottom 9th, they don't bat
@@ -820,9 +914,10 @@
                     break;
                 }
 
-                const homeRuns = simulateHalfInning(homeTeamId, awayTeamId, awayPitcher);
-                homeScore += homeRuns;
-                boxScore.homeLineScore.push(homeRuns);
+                const homeResult = simulateHalfInning(homeTeamId, awayTeamId, awayPitcher, true);
+                homeScore += homeResult.runs;
+                awayPitcherOuts += homeResult.outs;
+                boxScore.homeLineScore.push(homeResult.runs);
 
                 // If home team wins in bottom 9th, game ends
                 if (inning === 9 && homeScore > awayScore) {
@@ -833,31 +928,28 @@
             // Extra innings if tied
             let inning = 10;
             while (homeScore === awayScore && inning <= 15) {
-                const awayRuns = simulateHalfInning(awayTeamId, homeTeamId, homePitcher);
-                awayScore += awayRuns;
-                boxScore.awayLineScore.push(awayRuns);
+                const awayResult = simulateHalfInning(awayTeamId, homeTeamId, homePitcher, false);
+                awayScore += awayResult.runs;
+                boxScore.awayLineScore.push(awayResult.runs);
 
-                const homeRuns = simulateHalfInning(homeTeamId, awayTeamId, awayPitcher);
-                homeScore += homeRuns;
-                boxScore.homeLineScore.push(homeRuns);
+                const homeResult = simulateHalfInning(homeTeamId, awayTeamId, awayPitcher, true);
+                homeScore += homeResult.runs;
+                boxScore.homeLineScore.push(homeResult.runs);
 
                 if (homeScore !== awayScore) break;
                 inning++;
             }
 
             // Update records
+            homeTeam.gamesPlayed++;
+            awayTeam.gamesPlayed++;
+
             if (homeScore > awayScore) {
                 homeTeam.record.wins++;
                 awayTeam.record.losses++;
-
-                if (homePitcher) homePitcher.stats.W++;
-                if (awayPitcher) awayPitcher.stats.L++;
             } else {
                 awayTeam.record.wins++;
                 homeTeam.record.losses++;
-
-                if (awayPitcher) awayPitcher.stats.W++;
-                if (homePitcher) homePitcher.stats.L++;
             }
 
             homeTeam.runsScored += homeScore;
@@ -882,11 +974,27 @@
             return team.roster.find(p => p.id === pitcherId);
         }
 
-        function simulateHalfInning(battingTeamId, fieldingTeamId, pitcher) {
+        function getBullpenPitcher(teamId, usedPitchers) {
+            // Get best available pitcher not yet used
+            const team = gameState.league.teams[teamId];
+            const available = team.roster.filter(p => p.isPitcher && !usedPitchers.has(p.id))
+                .sort((a, b) => {
+                    const aAvg = (a.ratings.stuff + a.ratings.movement + a.ratings.control) / 3;
+                    const bAvg = (b.ratings.stuff + b.ratings.movement + b.ratings.control) / 3;
+                    return bAvg - aAvg;
+                });
+
+            return available.length > 0 ? available[0] : null;
+        }
+
+        function simulateHalfInning(battingTeamId, fieldingTeamId, pitcher, isHomeTeam) {
             const battingTeam = gameState.league.teams[battingTeamId];
             let runs = 0;
             let outs = 0;
-            let bases = [false, false, false]; // 1st, 2nd, 3rd
+            let bases = [null, null, null]; // Players on 1st, 2nd, 3rd
+
+            // Home field advantage: +7% to run probability
+            const homeBonus = isHomeTeam ? 1.07 : 1.0;
 
             while (outs < 3) {
                 // Get random batter from lineup
@@ -898,47 +1006,92 @@
                     continue;
                 }
 
-                const result = simulateAtBat(batter, pitcher);
+                const result = simulateAtBat(batter, pitcher, homeBonus);
+
+                // Update batter stats
+                batter.stats.AB++;
 
                 switch (result.outcome) {
                     case 'single':
-                        if (bases[2]) runs++;
-                        if (bases[1]) bases[2] = true;
-                        if (bases[0]) bases[1] = true;
-                        bases[0] = true;
+                        // Score runner from 3rd
+                        if (bases[2]) {
+                            runs++;
+                            batter.stats.RBI++;
+                            bases[2].stats.R++;
+                        }
+                        // Advance runners
+                        if (bases[1]) {
+                            bases[2] = bases[1];
+                        } else {
+                            bases[2] = null;
+                        }
+                        if (bases[0]) {
+                            bases[1] = bases[0];
+                        } else {
+                            bases[1] = null;
+                        }
+                        bases[0] = batter;
                         batter.stats.H++;
                         break;
 
                     case 'double':
-                        if (bases[2]) runs++;
-                        if (bases[1]) runs++;
-                        if (bases[0]) bases[2] = true;
-                        bases[1] = true;
-                        bases[0] = false;
+                        // Score runners from 3rd and 2nd
+                        if (bases[2]) {
+                            runs++;
+                            batter.stats.RBI++;
+                            bases[2].stats.R++;
+                        }
+                        if (bases[1]) {
+                            runs++;
+                            batter.stats.RBI++;
+                            bases[1].stats.R++;
+                        }
+                        // Runner from 1st goes to 3rd
+                        if (bases[0]) {
+                            bases[2] = bases[0];
+                        } else {
+                            bases[2] = null;
+                        }
+                        bases[1] = batter;
+                        bases[0] = null;
                         batter.stats.H++;
                         break;
 
                     case 'triple':
-                        runs += bases.filter(b => b).length;
-                        bases = [false, false, true];
+                        // Score all runners
+                        const rbis = bases.filter(b => b).length;
+                        runs += rbis;
+                        batter.stats.RBI += rbis;
+                        bases.forEach(b => { if (b) b.stats.R++; });
+                        bases = [null, null, batter];
                         batter.stats.H++;
                         break;
 
                     case 'homerun':
-                        runs += 1 + bases.filter(b => b).length;
-                        bases = [false, false, false];
-                        batter.stats.H++;
+                        const hrRbis = 1 + bases.filter(b => b).length;
+                        runs += hrRbis;
+                        batter.stats.RBI += hrRbis;
                         batter.stats.HR++;
-                        batter.stats.RBI += 1 + bases.filter(b => b).length;
+                        batter.stats.R++;
+                        bases.forEach(b => { if (b) b.stats.R++; });
+                        bases = [null, null, null];
+                        batter.stats.H++;
                         break;
 
                     case 'walk':
+                        // Force runners if bases loaded
                         if (bases[0] && bases[1] && bases[2]) {
                             runs++;
+                            batter.stats.RBI++;
+                            bases[2].stats.R++;
                         }
-                        if (bases[0] && bases[1]) bases[2] = true;
-                        if (bases[0]) bases[1] = true;
-                        bases[0] = true;
+                        if (bases[0] && bases[1]) {
+                            bases[2] = bases[1];
+                        }
+                        if (bases[0]) {
+                            bases[1] = bases[0];
+                        }
+                        bases[0] = batter;
                         batter.stats.BB++;
                         break;
 
@@ -952,26 +1105,26 @@
                         outs++;
                         break;
                 }
-
-                batter.stats.AB++;
             }
 
+            // Update pitcher stats
             if (pitcher) {
                 pitcher.stats.IP += 1;
                 pitcher.stats.ER += runs;
-                pitcher.stats.HA += bases.filter(b => b).length;
+                const hits = bases.filter(b => b).length;
+                pitcher.stats.HA += hits;
             }
 
-            return runs;
+            return { runs, outs };
         }
 
-        function simulateAtBat(batter, pitcher) {
+        function simulateAtBat(batter, pitcher, homeBonus = 1.0) {
             const pitcherRating = pitcher ?
                 (pitcher.ratings.stuff + pitcher.ratings.movement + pitcher.ratings.control) / 3 : 50;
             const batterRating = (batter.ratings.contact + batter.ratings.power + batter.ratings.eye) / 3;
 
             const matchupDiff = batterRating - pitcherRating;
-            const baseChance = 0.25 + (matchupDiff / 200); // Base hit probability
+            let baseChance = (0.25 + (matchupDiff / 200)) * homeBonus; // Base hit probability with home bonus
 
             const roll = Math.random();
 
@@ -980,18 +1133,18 @@
                 const hitRoll = Math.random();
                 const powerFactor = batter.ratings.power / 100;
 
-                if (hitRoll < 0.02 * powerFactor * 2) {
+                if (hitRoll < 0.025 * powerFactor * 2.5) {
                     return { outcome: 'homerun' };
-                } else if (hitRoll < 0.05) {
+                } else if (hitRoll < 0.04) {
                     return { outcome: 'triple' };
-                } else if (hitRoll < 0.15 + powerFactor * 0.1) {
+                } else if (hitRoll < 0.15 + powerFactor * 0.15) {
                     return { outcome: 'double' };
                 } else {
                     return { outcome: 'single' };
                 }
-            } else if (roll < baseChance * 0.7 + (batter.ratings.eye / 100) * 0.1) {
+            } else if (roll < baseChance * 0.7 + (batter.ratings.eye / 100) * 0.12) {
                 return { outcome: 'walk' };
-            } else if (roll < baseChance * 0.7 + 0.25) {
+            } else if (roll < baseChance * 0.7 + 0.30) {
                 return { outcome: 'strikeout' };
             } else {
                 return { outcome: 'out' };
@@ -999,8 +1152,18 @@
         }
 
         function simulateDay() {
+            if (gameState.league.seasonComplete) {
+                if (!gameState.league.playoffsComplete) {
+                    showError('Regular season complete! Simulate playoffs.');
+                } else {
+                    showError('Season and playoffs complete!');
+                }
+                return;
+            }
+
             if (gameState.league.currentDay >= gameState.league.totalDays) {
-                showError('Season complete!');
+                gameState.league.seasonComplete = true;
+                showSuccess('Regular season complete! Ready for playoffs.');
                 return;
             }
 
@@ -1022,10 +1185,15 @@
                 const winner = result.homeScore > result.awayScore ? homeTeam.name : awayTeam.name;
                 const score = `${result.awayScore}-${result.homeScore}`;
 
-                addNews(`${winner} defeats ${result.homeScore > result.awayScore ? awayTeam.name : homeTeam.name} ${score}`, `Day ${gameState.league.currentDay + 1}`);
+                addNews(`${winner} defeats ${result.homeScore > result.awayScore ? awayTeam.name : homeTeam.name} ${score}`, getSeasonDate());
             }
 
             gameState.league.currentDay++;
+
+            if (gameState.league.currentDay >= gameState.league.totalDays) {
+                gameState.league.seasonComplete = true;
+            }
+
             saveToLocalStorage();
             updateAllStats();
 
@@ -1055,6 +1223,10 @@
                 gameState.league.currentDay++;
             }
 
+            if (gameState.league.currentDay >= gameState.league.totalDays) {
+                gameState.league.seasonComplete = true;
+            }
+
             saveToLocalStorage();
             updateAllStats();
 
@@ -1062,10 +1234,10 @@
             renderCurrentScreen();
             updateTeamInfo();
 
-            addNews(`Week ${Math.floor(startDay / 7) + 1} complete - ${allResults.length} games played`, `Day ${gameState.league.currentDay}`);
+            addNews(`Week ${Math.floor(startDay / 7) + 1} complete - ${allResults.length} games played`, getSeasonDate());
         }
 
-        function simulateSeason() {
+        function simulateToPlayoffs() {
             let gamesSimulated = 0;
 
             while (gameState.league.currentDay < gameState.league.totalDays) {
@@ -1084,14 +1256,138 @@
                 gameState.league.currentDay++;
             }
 
+            gameState.league.seasonComplete = true;
             saveToLocalStorage();
             updateAllStats();
 
-            addNews(`Season complete! ${gamesSimulated} games simulated to completion`, `Day ${gameState.league.currentDay}`);
-            showSuccess(`Season finished! Simulated ${gamesSimulated} games.`);
+            addNews(`Regular season complete! ${gamesSimulated} games simulated. Playoffs ready.`, getSeasonDate());
+            showSuccess(`Regular season finished! Simulated ${gamesSimulated} games. Click 'Simulate Full Season + Playoffs' to run playoffs.`);
 
             renderCurrentScreen();
             updateTeamInfo();
+        }
+
+        function simulateSeason() {
+            // First complete regular season if not done
+            if (!gameState.league.seasonComplete) {
+                simulateToPlayoffs();
+            }
+
+            // Then simulate playoffs
+            simulatePlayoffs();
+        }
+
+        function simulatePlayoffs() {
+            if (!gameState.league.seasonComplete) {
+                showError('Regular season not complete yet!');
+                return;
+            }
+
+            if (gameState.league.playoffsComplete) {
+                showError('Playoffs already completed!');
+                return;
+            }
+
+            addNews('🏆 PLAYOFFS BEGIN! 🏆', getSeasonDate());
+
+            // Get division winners and wild cards
+            const alEast = getDivisionWinner('AL East');
+            const alCentral = getDivisionWinner('AL Central');
+            const alWest = getDivisionWinner('AL West');
+            const nlEast = getDivisionWinner('NL East');
+            const nlCentral = getDivisionWinner('NL Central');
+            const nlWest = getDivisionWinner('NL West');
+
+            const alWildCards = getWildCards('AL', [alEast, alCentral, alWest]);
+            const nlWildCards = getWildCards('NL', [nlEast, nlCentral, nlWest]);
+
+            // Wild Card Round (best of 3)
+            addNews(`Wild Card: ${gameState.league.teams[alWildCards[0]].name} vs ${gameState.league.teams[alWildCards[1]].name}`, 'October');
+            const alWC = simulateSeries(alWildCards[0], alWildCards[1], 3);
+
+            addNews(`Wild Card: ${gameState.league.teams[nlWildCards[0]].name} vs ${gameState.league.teams[nlWildCards[1]].name}`, 'October');
+            const nlWC = simulateSeries(nlWildCards[0], nlWildCards[1], 3);
+
+            // Division Series (best of 5)
+            const alDivisionTeams = [alEast, alCentral, alWest, alWC].sort((a, b) =>
+                getWinPct(b) - getWinPct(a)
+            );
+            const nlDivisionTeams = [nlEast, nlCentral, nlWest, nlWC].sort((a, b) =>
+                getWinPct(b) - getWinPct(a)
+            );
+
+            addNews(`ALDS: ${gameState.league.teams[alDivisionTeams[0]].name} vs ${gameState.league.teams[alDivisionTeams[3]].name}`, 'October');
+            const alds1 = simulateSeries(alDivisionTeams[0], alDivisionTeams[3], 5);
+
+            addNews(`ALDS: ${gameState.league.teams[alDivisionTeams[1]].name} vs ${gameState.league.teams[alDivisionTeams[2]].name}`, 'October');
+            const alds2 = simulateSeries(alDivisionTeams[1], alDivisionTeams[2], 5);
+
+            addNews(`NLDS: ${gameState.league.teams[nlDivisionTeams[0]].name} vs ${gameState.league.teams[nlDivisionTeams[3]].name}`, 'October');
+            const nlds1 = simulateSeries(nlDivisionTeams[0], nlDivisionTeams[3], 5);
+
+            addNews(`NLDS: ${gameState.league.teams[nlDivisionTeams[1]].name} vs ${gameState.league.teams[nlDivisionTeams[2]].name}`, 'October');
+            const nlds2 = simulateSeries(nlDivisionTeams[1], nlDivisionTeams[2], 5);
+
+            // League Championship Series (best of 7)
+            addNews(`ALCS: ${gameState.league.teams[alds1].name} vs ${gameState.league.teams[alds2].name}`, 'October');
+            const alcs = simulateSeries(alds1, alds2, 7);
+
+            addNews(`NLCS: ${gameState.league.teams[nlds1].name} vs ${gameState.league.teams[nlds2].name}`, 'October');
+            const nlcs = simulateSeries(nlds1, nlds2, 7);
+
+            // World Series (best of 7)
+            addNews(`🏆 WORLD SERIES: ${gameState.league.teams[alcs].name} vs ${gameState.league.teams[nlcs].name} 🏆`, 'October');
+            const champion = simulateSeries(alcs, nlcs, 7);
+
+            addNews(`🏆🏆🏆 WORLD SERIES CHAMPION: ${gameState.league.teams[champion].name} 🏆🏆🏆`, 'November');
+            showSuccess(`🏆 ${gameState.league.teams[champion].name} are World Series Champions! 🏆`);
+
+            gameState.league.playoffsComplete = true;
+            saveToLocalStorage();
+            renderCurrentScreen();
+        }
+
+        function getDivisionWinner(divisionName) {
+            const teamIds = DIVISIONS[divisionName];
+            return teamIds.sort((a, b) => getWinPct(b) - getWinPct(a))[0];
+        }
+
+        function getWildCards(league, divisionWinners) {
+            const allTeams = Object.values(gameState.league.teams)
+                .filter(t => t.league.startsWith(league) && !divisionWinners.includes(t.id))
+                .sort((a, b) => getWinPct(b.id) - getWinPct(a.id));
+
+            return [allTeams[0].id, allTeams[1].id];
+        }
+
+        function getWinPct(teamId) {
+            const team = gameState.league.teams[teamId];
+            return team.record.wins / (team.record.wins + team.record.losses || 1);
+        }
+
+        function simulateSeries(team1Id, team2Id, gamesNeeded) {
+            const winsNeeded = Math.ceil(gamesNeeded / 2);
+            let team1Wins = 0;
+            let team2Wins = 0;
+
+            while (team1Wins < winsNeeded && team2Wins < winsNeeded) {
+                const homeTeam = (team1Wins + team2Wins) % 2 === 0 ? team1Id : team2Id;
+                const awayTeam = homeTeam === team1Id ? team2Id : team1Id;
+
+                const result = simulateGame(homeTeam, awayTeam);
+
+                if (result.homeScore > result.awayScore) {
+                    if (homeTeam === team1Id) team1Wins++; else team2Wins++;
+                } else {
+                    if (awayTeam === team1Id) team1Wins++; else team2Wins++;
+                }
+            }
+
+            const winner = team1Wins === winsNeeded ? team1Id : team2Id;
+            const loser = winner === team1Id ? team2Id : team1Id;
+            addNews(`${gameState.league.teams[winner].name} defeat ${gameState.league.teams[loser].name} ${Math.max(team1Wins, team2Wins)}-${Math.min(team1Wins, team2Wins)}`, 'Playoffs');
+
+            return winner;
         }
 
         function updateAllStats() {
@@ -1146,6 +1442,16 @@
             container.innerHTML = html;
         }
 
+        function getSeasonDate() {
+            // Convert day number to approximate calendar date
+            const startDate = new Date(gameState.league.season, 2, 28); // March 28 start
+            const currentDate = new Date(startDate);
+            currentDate.setDate(startDate.getDate() + gameState.league.currentDay);
+
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            return `${months[currentDate.getMonth()]} ${currentDate.getDate()}, ${gameState.league.season}`;
+        }
+
         // ========================================
         // ROSTER UPDATE FUNCTION
         // ========================================
@@ -1162,7 +1468,14 @@
                 gameState.league.teams = {};
                 gameState.league.schedule = [];
                 gameState.league.currentDay = 0;
+                gameState.league.seasonComplete = false;
+                gameState.league.playoffsComplete = false;
                 gameState.news = [];
+
+                // Clear divisions
+                for (const div in DIVISIONS) {
+                    DIVISIONS[div] = [];
+                }
 
                 // Fetch fresh data
                 await fetchAllTeamsAndRosters();
@@ -1243,6 +1556,11 @@
             grid.innerHTML = html;
         }
 
+        function makeRatingBar(rating) {
+            const pct = Math.min(100, Math.max(0, rating));
+            return `<span class="rating-bar"><span class="rating-fill" style="width: ${pct}%"></span></span>`;
+        }
+
         function renderRoster() {
             const container = document.getElementById('rosterContent');
             if (!gameState.userTeamId) {
@@ -1262,10 +1580,10 @@
                     <tr>
                         <td>${player.name}</td>
                         <td>${player.position}</td>
-                        <td>${player.ratings.contact}</td>
-                        <td>${player.ratings.power}</td>
-                        <td>${player.ratings.eye}</td>
-                        <td>${player.ratings.speed}</td>
+                        <td>${player.ratings.contact} ${makeRatingBar(player.ratings.contact)}</td>
+                        <td>${player.ratings.power} ${makeRatingBar(player.ratings.power)}</td>
+                        <td>${player.ratings.eye} ${makeRatingBar(player.ratings.eye)}</td>
+                        <td>${player.ratings.speed} ${makeRatingBar(player.ratings.speed)}</td>
                         <td>${player.stats.AVG || '.000'}</td>
                         <td>${player.stats.HR}</td>
                         <td>${player.stats.RBI}</td>
@@ -1282,10 +1600,10 @@
                 html += `
                     <tr>
                         <td>${player.name}</td>
-                        <td>${player.ratings.stuff}</td>
-                        <td>${player.ratings.movement}</td>
-                        <td>${player.ratings.control}</td>
-                        <td>${player.ratings.stamina}</td>
+                        <td>${player.ratings.stuff} ${makeRatingBar(player.ratings.stuff)}</td>
+                        <td>${player.ratings.movement} ${makeRatingBar(player.ratings.movement)}</td>
+                        <td>${player.ratings.control} ${makeRatingBar(player.ratings.control)}</td>
+                        <td>${player.ratings.stamina} ${makeRatingBar(player.ratings.stamina)}</td>
                         <td>${player.stats.W}-${player.stats.L}</td>
                         <td>${player.stats.ERA || '0.00'}</td>
                         <td>${player.stats.WHIP || '0.00'}</td>
@@ -1306,30 +1624,30 @@
             }
 
             const team = gameState.league.teams[gameState.userTeamId];
-            const positionPlayers = team.roster.filter(p => !p.isPitcher);
             const pitchers = team.roster.filter(p => p.isPitcher);
 
             let html = '<h3 class="stat-header">Batting Lineup</h3>';
             html += '<button onclick="autoSetLineup(\'' + gameState.userTeamId + '\'); renderLineup();" class="secondary">Auto-Fill Best Lineup</button>';
 
             for (let i = 0; i < 9; i++) {
+                const requiredPos = LINEUP_POSITIONS[i];
                 const playerId = team.lineup[i];
                 const player = team.roster.find(p => p.id === playerId);
+                const eligiblePlayers = getEligiblePlayersForPosition(gameState.userTeamId, requiredPos);
 
                 html += `
                     <div class="lineup-slot">
-                        <span>${i + 1}.</span>
+                        <span style="min-width: 60px;">${i + 1}. ${requiredPos}</span>
                         <select onchange="setLineupSpot(${i}, this.value)">
-                            <option value="">-- Select Player --</option>
+                            <option value="">-- Select ${requiredPos} --</option>
                 `;
 
-                for (const p of positionPlayers) {
-                    html += `<option value="${p.id}" ${p.id === playerId ? 'selected' : ''}>${p.name} (${p.position})</option>`;
+                for (const p of eligiblePlayers) {
+                    html += `<option value="${p.id}" ${p.id === playerId ? 'selected' : ''}>${p.name} (${p.position}) [${p.ratings.contact}/${p.ratings.power}/${p.ratings.eye}]</option>`;
                 }
 
                 html += `
                         </select>
-                        <span>${player ? `${player.position} | Contact: ${player.ratings.contact} Power: ${player.ratings.power}` : ''}</span>
                     </div>
                 `;
             }
@@ -1343,18 +1661,17 @@
 
                 html += `
                     <div class="lineup-slot">
-                        <span>SP${i + 1}</span>
+                        <span style="min-width: 60px;">SP${i + 1}</span>
                         <select onchange="setRotationSpot(${i}, this.value)">
                             <option value="">-- Select Pitcher --</option>
                 `;
 
                 for (const p of pitchers) {
-                    html += `<option value="${p.id}" ${p.id === playerId ? 'selected' : ''}>${p.name}</option>`;
+                    html += `<option value="${p.id}" ${p.id === playerId ? 'selected' : ''}>${p.name} [${p.ratings.stuff}/${p.ratings.control}]</option>`;
                 }
 
                 html += `
                         </select>
-                        <span>${player ? `Stuff: ${player.ratings.stuff} Control: ${player.ratings.control}` : ''}</span>
                     </div>
                 `;
             }
@@ -1366,10 +1683,13 @@
             const info = document.getElementById('simInfo');
             const gamesPlayed = gameState.league.schedule.filter(g => g.played).length;
             const totalGames = gameState.league.schedule.length;
+            const dateStr = getSeasonDate();
 
             info.innerHTML = `
-                <div>Day ${gameState.league.currentDay + 1} of ${gameState.league.totalDays}</div>
+                <div><strong>${dateStr}</strong> — Day ${gameState.league.currentDay + 1} of ${gameState.league.totalDays}</div>
                 <div>${gamesPlayed} / ${totalGames} games completed</div>
+                ${gameState.league.seasonComplete ? '<div style="color: #10b981;">✓ Regular Season Complete</div>' : ''}
+                ${gameState.league.playoffsComplete ? '<div style="color: #fbbf24;">🏆 Playoffs Complete</div>' : ''}
             `;
         }
 
@@ -1431,6 +1751,11 @@
                 }
             }
 
+            // Calculate minimum qualifiers (3.1 PA per game played)
+            const maxGames = Math.max(...Object.values(gameState.league.teams).map(t => t.gamesPlayed || 0));
+            const minPA = Math.floor(maxGames * 3.1);
+            const minIP = Math.floor(maxGames * 1.0);
+
             let html = '<h3 class="stat-header">Batting Leaders</h3>';
 
             // Home Run Leaders
@@ -1446,13 +1771,13 @@
             }
             html += '</tbody></table>';
 
-            // Batting Average Leaders
+            // Batting Average Leaders (min AB qualifier)
             const avgLeaders = allBatters
-                .filter(p => p.stats.AB >= 50)
+                .filter(p => p.stats.AB >= minPA)
                 .sort((a, b) => (b.stats.H / b.stats.AB) - (a.stats.H / a.stats.AB))
                 .slice(0, 10);
 
-            html += '<h4 style="color: #60a5fa; margin-top: 15px;">Batting Average</h4>';
+            html += `<h4 style="color: #60a5fa; margin-top: 15px;">Batting Average (min ${minPA} AB)</h4>`;
             html += '<table><thead><tr><th>Player</th><th>Team</th><th>AVG</th><th>H</th><th>AB</th></tr></thead><tbody>';
             for (const p of avgLeaders) {
                 html += `<tr><td>${p.name}</td><td>${p.teamName}</td><td>${p.stats.AVG}</td><td>${p.stats.H}</td><td>${p.stats.AB}</td></tr>`;
@@ -1474,13 +1799,13 @@
             }
             html += '</tbody></table>';
 
-            // ERA Leaders
+            // ERA Leaders (min IP qualifier)
             const eraLeaders = allPitchers
-                .filter(p => p.stats.IP >= 20)
+                .filter(p => p.stats.IP >= minIP)
                 .sort((a, b) => parseFloat(a.stats.ERA || 99) - parseFloat(b.stats.ERA || 99))
                 .slice(0, 10);
 
-            html += '<h4 style="color: #60a5fa; margin-top: 15px;">ERA</h4>';
+            html += `<h4 style="color: #60a5fa; margin-top: 15px;">ERA (min ${minIP} IP)</h4>`;
             html += '<table><thead><tr><th>Player</th><th>Team</th><th>ERA</th><th>IP</th><th>WHIP</th></tr></thead><tbody>';
             for (const p of eraLeaders) {
                 html += `<tr><td>${p.name}</td><td>${p.teamName}</td><td>${p.stats.ERA}</td><td>${p.stats.IP.toFixed(1)}</td><td>${p.stats.WHIP}</td></tr>`;
@@ -1548,7 +1873,8 @@
 
             const team = gameState.league.teams[gameState.userTeamId];
             const record = `${team.record.wins}-${team.record.losses}`;
-            el.textContent = `Managing: ${team.name} (${record})`;
+            const dateStr = getSeasonDate();
+            el.textContent = `Managing: ${team.name} (${record}) | ${dateStr}`;
         }
 
         function switchTab(tabName) {
